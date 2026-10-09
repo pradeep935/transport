@@ -9,7 +9,7 @@
  *
  * Every method resolves (never rejects) to { ok: true, source, ... } or { ok: false, code, source }.
  * Error codes: INVALID_INPUT, CONSENT_REQUIRED, INVALID_OTP, OTP_EXPIRED, TOO_MANY_ATTEMPTS, RESEND_TOO_SOON,
- *              NOT_FOUND, NOT_CONFIGURED, PROVIDER_UNAVAILABLE.
+ *              NOT_FOUND, NOT_CONFIGURED, PROVIDER_UNAVAILABLE, DUPLICATE, INVALID_STATE, VEHICLE_IN_USE.
  */
 (function () {
   const cfg = window.WHEELTRACK_CONFIG || {};
@@ -246,16 +246,21 @@
         const id = normalizeTransporterId(transporterId);
         if (!isValidTransporterId(id)) return fail("INVALID_INPUT");
         const match = SANDBOX_TRANSPORTERS[id];
-        return match ? { ok: true, transporter: { ...match, contact: maskPhone(match.contact) } } : fail("NOT_FOUND");
+        if (match) return { ok: true, transporter: { ...match, contact: maskPhone(match.contact) } };
+        // Companies registered through Transporter / Shipper Registration can be linked once Wheeltrack approves them.
+        const company = companies()[id];
+        if (!company || company.status !== "approved") return fail("NOT_FOUND");
+        return { ok: true, transporter: { id, company: company.legalName, contact: maskPhone(company.contact), email: company.email, city: company.city, state: company.state, fleetSize: company.fleet || 0, since: company.approvedAt.slice(0, 4), verified: true } };
       });
     },
     // Idempotent: the same driver + transporter pair always maps to one request.
-    requestAssociation({ driverId, transporterId }) {
-      return call("transporter", "requestAssociation", { driverId, transporterId }, () => {
+    // driver: read-only summary shown to the transporter (they can never edit driver identity data).
+    requestAssociation({ driverId, transporterId, driver }) {
+      return call("transporter", "requestAssociation", { driverId, transporterId, driver }, () => {
         const all = associations();
-        const existing = Object.values(all).find((r) => r.driverId === driverId && r.transporterId === transporterId && r.status !== "withdrawn");
+        const existing = Object.values(all).find((r) => r.driverId === driverId && r.transporterId === transporterId && !["withdrawn", "rejected", "removed"].includes(r.status));
         if (existing) return { ok: true, requestId: existing.requestId, status: existing.status, createdAt: existing.createdAt };
-        const record = { requestId: uid("REQ"), driverId, transporterId, status: "pending", createdAt: new Date().toISOString() };
+        const record = { requestId: uid("REQ"), driverId, transporterId, driver: driver || null, status: "pending", createdAt: new Date().toISOString() };
         all[record.requestId] = record;
         saveAssociations(all);
         return { ok: true, requestId: record.requestId, status: record.status, createdAt: record.createdAt };
@@ -266,14 +271,51 @@
         const all = associations();
         const record = all[requestId];
         if (!record) return fail("NOT_FOUND");
+        // Only the built-in sandbox transporters answer on a timer. Registered companies decide from their dashboard.
         const due = Date.parse(record.createdAt) + (sandboxCfg.TRANSPORTER_APPROVAL_SECONDS ?? 20) * 1000;
-        if (record.status === "pending" && Date.now() >= due) {
+        if (SANDBOX_TRANSPORTERS[record.transporterId] && record.status === "pending" && Date.now() >= due) {
           record.status = "approved";
           record.decidedAt = new Date(due).toISOString();
           record.vehicle = SANDBOX_VEHICLE;
           saveAssociations(all);
         }
-        return { ok: true, requestId, status: record.status, decidedAt: record.decidedAt || "", vehicle: record.vehicle || null };
+        return { ok: true, requestId, status: record.status, decidedAt: record.decidedAt || "", reason: record.reason || "", vehicle: record.vehicle || null };
+      });
+    },
+    // ---- Transporter side ----
+    listAssociations({ transporterId }) {
+      return call("transporter", "listAssociations", { transporterId }, () => ({
+        ok: true,
+        requests: Object.values(associations()).filter((r) => r.transporterId === transporterId && r.status !== "withdrawn").sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      }));
+    },
+    // decision: "approved" | "rejected" (reason required) | "removed" (approved association deactivated, reason required).
+    decideAssociation({ transporterId, requestId, decision, reason }) {
+      return call("transporter", "decideAssociation", { transporterId, requestId, decision, reason }, () => {
+        const all = associations();
+        const record = all[requestId];
+        if (!record || record.transporterId !== transporterId) return fail("NOT_FOUND");
+        const allowed = { pending: ["approved", "rejected"], approved: ["removed"] }[record.status] || [];
+        if (!allowed.includes(decision)) return fail("INVALID_STATE");
+        if (decision !== "approved" && !String(reason || "").trim()) return fail("INVALID_INPUT");
+        Object.assign(record, { status: decision, reason: decision === "approved" ? "" : reason.trim(), decidedAt: new Date().toISOString() });
+        // Approval never assigns a vehicle; removal also ends any assignment.
+        if (decision === "removed") record.vehicle = null;
+        saveAssociations(all);
+        return { ok: true, request: record };
+      });
+    },
+    // Assigning is a separate operation after approval. vehicle: null removes the assignment.
+    assignVehicle({ transporterId, requestId, vehicle }) {
+      return call("transporter", "assignVehicle", { transporterId, requestId, vehicle }, () => {
+        const all = associations();
+        const record = all[requestId];
+        if (!record || record.transporterId !== transporterId) return fail("NOT_FOUND");
+        if (record.status !== "approved") return fail("INVALID_STATE");
+        if (vehicle && Object.values(all).some((r) => r.requestId !== requestId && r.transporterId === transporterId && r.status === "approved" && r.vehicle && r.vehicle.registration === vehicle.registration)) return fail("VEHICLE_IN_USE");
+        record.vehicle = vehicle || null;
+        saveAssociations(all);
+        return { ok: true, request: record };
       });
     },
     withdrawAssociation({ requestId }) {
@@ -286,12 +328,216 @@
     }
   };
 
+  // ---- Transporter / Shipper company registration ----
+  // Sandbox registry of submitted companies (stand-in for the companies + registration_requests tables).
+  const COMPANY_KEY = "wheeltrack_sandbox_companies";
+  function companies() {
+    try { return JSON.parse(localStorage.getItem(COMPANY_KEY) || "{}"); } catch { return {}; }
+  }
+  function saveCompanies(all) {
+    try { localStorage.setItem(COMPANY_KEY, JSON.stringify(all)); } catch { /* sandbox only */ }
+  }
+  const PAN_RE = /^[A-Z]{5}\d{4}[A-Z]$/;
+  const GSTIN_RE = /^\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
+  const CIN_RE = /^[LU]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}$/;
+  const LLPIN_RE = /^[A-Z]{3}-\d{4}$/;
+  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+  function normalizeCode(value) {
+    return String(value || "").toUpperCase().replace(/\s+/g, "");
+  }
+  // PAN 4th character → holder type (Income Tax Department convention).
+  const PAN_HOLDER = { C: "Company", F: "Firm / LLP", P: "Individual", H: "HUF", A: "Association of Persons", T: "Trust", B: "Body of Individuals", G: "Government", L: "Local Authority", J: "Artificial Juridical Person" };
+  const GST_STATES = { "27": "Maharashtra", "07": "Delhi", "29": "Karnataka", "33": "Tamil Nadu", "24": "Gujarat", "08": "Rajasthan", "09": "Uttar Pradesh", "23": "Madhya Pradesh", "06": "Haryana", "03": "Punjab", "19": "West Bengal", "36": "Telangana", "37": "Andhra Pradesh", "32": "Kerala", "10": "Bihar" };
+  // Sandbox outcomes are driven by the number: digits 0000 → not found, 9999 → provider unavailable.
+  function sandboxOutcome(code) {
+    if (/0000/.test(code)) return { ok: true, status: "failed", reason: "NOT_FOUND" };
+    if (/9999/.test(code)) return fail("PROVIDER_UNAVAILABLE");
+    return null;
+  }
+
+  const CompanyAccountService = {
+    isValidEmail: (value) => EMAIL_RE.test(String(value || "").trim()),
+    // Duplicate mobile / email check against registered companies. ownId excludes the caller's own record.
+    checkAvailability({ mobile, email, ownId }) {
+      return call("companyAccount", "checkAvailability", { mobile, email }, () => {
+        const others = Object.values(companies()).filter((c) => c.transporterId !== ownId);
+        return { ok: true, mobileTaken: Boolean(mobile) && others.some((c) => c.accountMobile === mobile), emailTaken: Boolean(email) && others.some((c) => c.accountEmail === String(email).toLowerCase()) };
+      });
+    },
+    // channel: "mobile" | "email". A verified contact never proves the business itself is verified.
+    sendOtp({ channel, target }) {
+      return call("companyAccount", "sendOtp", { channel, target }, () => {
+        if (channel === "mobile" && !/^[6-9]\d{9}$/.test(target)) return fail("INVALID_INPUT");
+        if (channel === "email" && !EMAIL_RE.test(target)) return fail("INVALID_INPUT");
+        return startOtp({ channel, target });
+      });
+    },
+    resendOtp({ referenceId }) {
+      return call("companyAccount", "resendOtp", { referenceId }, () => resendOtp(referenceId));
+    },
+    verifyOtp({ referenceId, otp }) {
+      return call("companyAccount", "verifyOtp", { referenceId, otp }, () => {
+        const result = checkOtp(referenceId, otp);
+        return result.ok ? { ok: true, channel: result.session.channel, target: result.session.target } : result;
+      });
+    }
+  };
+
+  // Every result returns status: "verified" | "failed"; PROVIDER_UNAVAILABLE comes back as { ok: false }.
+  const BusinessKycService = {
+    normalize: normalizeCode,
+    isValidPan: (v) => PAN_RE.test(normalizeCode(v)),
+    isValidGstin: (v) => GSTIN_RE.test(normalizeCode(v)),
+    isValidCin: (v) => CIN_RE.test(normalizeCode(v)),
+    isValidLlpin: (v) => LLPIN_RE.test(normalizeCode(v)),
+    panHolderType: (v) => PAN_HOLDER[normalizeCode(v)[3]] || "",
+    verifyPan({ pan, name }) {
+      return call("businessKyc", "verifyPan", { pan, name }, () => {
+        const value = normalizeCode(pan);
+        if (!PAN_RE.test(value)) return fail("INVALID_INPUT");
+        const outcome = sandboxOutcome(value);
+        if (outcome) return outcome;
+        return { ok: true, status: "verified", result: { pan: value, name: String(name || "").toUpperCase(), holderType: PAN_HOLDER[value[3]] || "Other", panStatus: "Active", nameMatch: "matched" } };
+      });
+    },
+    verifyGstin({ gstin, pan, name, address }) {
+      return call("businessKyc", "verifyGstin", { gstin, pan }, () => {
+        const value = normalizeCode(gstin);
+        if (!GSTIN_RE.test(value)) return fail("INVALID_INPUT");
+        const outcome = sandboxOutcome(value);
+        if (outcome) return outcome;
+        return { ok: true, status: "verified", result: { gstin: value, legalName: String(name || "").toUpperCase(), gstStatus: "Active", registeredAddress: address || "", state: GST_STATES[value.slice(0, 2)] || `State code ${value.slice(0, 2)}`, panMatch: value.slice(2, 12) === normalizeCode(pan) ? "matched" : "mismatch", registrationDate: "2019-07-01" } };
+      });
+    },
+    // number: CIN (companies) or LLPIN (LLPs).
+    verifyCin({ number, name }) {
+      return call("businessKyc", "verifyCin", { number, name }, () => {
+        const value = normalizeCode(number);
+        const isLlp = LLPIN_RE.test(value);
+        if (!CIN_RE.test(value) && !isLlp) return fail("INVALID_INPUT");
+        const outcome = sandboxOutcome(value);
+        if (outcome) return outcome;
+        return { ok: true, status: "verified", result: { number: value, companyName: String(name || "").toUpperCase(), incorporationStatus: "Active", incorporatedOn: isLlp ? "2016-04-01" : `${value.slice(8, 12)}-04-01`, registrar: isLlp ? "Registrar of Companies" : `RoC-${value.slice(6, 8)}` } };
+      });
+    }
+  };
+
+  function companyIdFor(all) {
+    let id;
+    do { id = `WTT-${String(Math.floor(20000 + Math.random() * 79999))}`; } while (all[id] || SANDBOX_TRANSPORTERS[id]);
+    return id;
+  }
+  const CompanyRegistrationService = {
+    // Creates the registration once; a resubmission keeps the same Transporter ID and Request ID.
+    submit({ transporterId, snapshot }) {
+      return call("companyRegistration", "submit", { transporterId, snapshot }, () => {
+        const all = companies();
+        const own = transporterId && all[transporterId];
+        const others = Object.values(all).filter((c) => c.transporterId !== transporterId && c.status !== "rejected");
+        const s = snapshot;
+        const dup = [["pan", s.kyc.pan], ["gstin", s.kyc.gstin], ["accountMobile", s.account.mobile], ["accountEmail", s.account.email]]
+          .find(([key, value]) => value && others.some((c) => c[key] === value));
+        if (dup) return { ok: false, code: "DUPLICATE", field: dup[0] };
+        if (own && !["info_required", "rejected"].includes(own.status)) return { ok: true, transporterId: own.transporterId, requestId: own.requestId, status: own.status, submittedAt: own.submittedAt, version: own.version, duplicate: true };
+        const now = new Date().toISOString();
+        const id = own ? own.transporterId : companyIdFor(all);
+        const record = {
+          ...(own || {}),
+          transporterId: id,
+          requestId: own ? own.requestId : uid("REG"),
+          version: own ? own.version + 1 : 1,
+          legalName: s.details.legalName, contact: s.details.contact, email: s.details.email, city: s.details.city, state: s.details.state, fleet: s.details.fleet,
+          accountMobile: s.account.mobile, accountEmail: s.account.email, pan: s.kyc.pan, gstin: s.kyc.gstin,
+          status: "pending_review", stage: "company", remarks: "", pendingRequirements: [], rejectedDocuments: [],
+          submittedAt: own ? own.submittedAt : now, resubmittedAt: own ? now : "", updatedAt: now,
+          history: [...((own && own.history) || []), { at: now, event: own ? "resubmitted" : "submitted", by: "applicant" }],
+          snapshot: s
+        };
+        all[id] = record;
+        saveCompanies(all);
+        return { ok: true, transporterId: id, requestId: record.requestId, status: record.status, submittedAt: record.submittedAt, version: record.version };
+      });
+    },
+    getStatus({ transporterId }) {
+      return call("companyRegistration", "getStatus", { transporterId }, () => {
+        const record = companies()[transporterId];
+        if (!record) return fail("NOT_FOUND");
+        const { snapshot, ...status } = record;
+        return { ok: true, registration: status };
+      });
+    },
+    // Wheeltrack admin review. In production this happens in the admin console with server-side checks;
+    // the sandbox exposes it so the full flow can be tested. decision: "approved" | "rejected" | "info_required".
+    adminDecision({ transporterId, decision, remarks, pendingRequirements, rejectedDocuments }) {
+      return call("companyRegistration", "adminDecision", { transporterId, decision }, () => {
+        const all = companies();
+        const record = all[transporterId];
+        if (!record) return fail("NOT_FOUND");
+        if (record.status !== "pending_review") return fail("INVALID_STATE");
+        if (decision !== "approved" && !String(remarks || "").trim()) return fail("INVALID_INPUT");
+        const now = new Date().toISOString();
+        Object.assign(record, {
+          status: decision, remarks: (remarks || "").trim(), updatedAt: now,
+          stage: decision === "approved" ? "done" : record.stage,
+          pendingRequirements: decision === "info_required" ? pendingRequirements || [] : [],
+          rejectedDocuments: decision === "info_required" ? rejectedDocuments || [] : [],
+          approvedAt: decision === "approved" ? now : record.approvedAt || ""
+        });
+        record.history.push({ at: now, event: decision, by: "Wheeltrack Admin", remarks: record.remarks });
+        saveCompanies(all);
+        const { snapshot, ...status } = record;
+        return { ok: true, registration: status };
+      });
+    },
+    // Sandbox: lets the admin review move through the stages one at a time.
+    adminAdvance({ transporterId }) {
+      return call("companyRegistration", "adminAdvance", { transporterId }, () => {
+        const all = companies();
+        const record = all[transporterId];
+        if (!record || record.status !== "pending_review") return fail("INVALID_STATE");
+        const order = ["company", "kyc", "representative", "documents", "final"];
+        const next = order[Math.min(order.indexOf(record.stage) + 1, order.length - 1)];
+        Object.assign(record, { stage: next, updatedAt: new Date().toISOString() });
+        saveCompanies(all);
+        const { snapshot, ...status } = record;
+        return { ok: true, registration: status };
+      });
+    }
+  };
+
+  // ---- Vehicle verification (RC / insurance / PUC / fitness) ----
+  const VehicleVerificationService = {
+    verifyRc({ registration }) {
+      return call("vehicle", "verifyRc", { registration }, () => {
+        const reg = normalizeCode(registration);
+        if (!/^[A-Z]{2}\d{1,2}[A-Z]{0,3}\d{1,4}$/.test(reg)) return fail("INVALID_INPUT");
+        if (reg.endsWith("0000")) return { ok: true, status: "failed", reason: "NOT_FOUND" };
+        if (reg.endsWith("9999")) return fail("PROVIDER_UNAVAILABLE");
+        return { ok: true, status: "verified", result: { registration: reg, type: "HCV", body: "Container", bodyLength: "32 ft", payload: "16", owner: "Registered owner on RC", fitnessUpto: "2028-03-31" } };
+      });
+    },
+    // kind: insurance | puc | fitness. Numbers ending 0000 fail, 9999 → provider unavailable.
+    verifyDocument({ kind, number }) {
+      return call("vehicle", "verifyDocument", { kind, number }, () => {
+        const value = normalizeCode(number);
+        if (!value) return fail("INVALID_INPUT");
+        if (value.endsWith("0000")) return { ok: true, status: "failed", reason: "NOT_FOUND" };
+        if (value.endsWith("9999")) return fail("PROVIDER_UNAVAILABLE");
+        return { ok: true, status: "verified", result: { kind, number: value } };
+      });
+    }
+  };
+
   window.WheeltrackServices = {
     providerFor,
     AuthService,
     AadhaarVerificationService,
     DrivingLicenceVerificationService,
     IdentityVerificationService,
-    TransporterService
+    TransporterService,
+    CompanyAccountService,
+    BusinessKycService,
+    CompanyRegistrationService,
+    VehicleVerificationService
   };
 })();

@@ -21,7 +21,11 @@ window.WHEELTRACK_CONFIG = {
     aadhaar: "sandbox",
     drivingLicence: "sandbox",
     identity: "sandbox",
-    transporter: "sandbox"
+    transporter: "sandbox",
+    companyAccount: "sandbox",
+    businessKyc: "sandbox",
+    companyRegistration: "sandbox",
+    vehicle: "sandbox"
   },
   API_ENDPOINT: "api/verification.php",
 
@@ -32,6 +36,10 @@ window.WHEELTRACK_CONFIG = {
    *   Driving licence number ending in 0000 → failed, ending in 9999 → source unavailable (pending), otherwise verified
    *   Transporter IDs: WTT-10021, WTT-10045 (any other ID → not found)
    *   Transporter approves an association request TRANSPORTER_APPROVAL_SECONDS after it is sent
+   *     (built-in sandbox transporters only; registered companies approve from their dashboard)
+   *   Company mobile / email OTP: SANDBOX.OTP
+   *   PAN / GSTIN / CIN / vehicle numbers containing 0000 → not found (failed), 9999 → provider unavailable
+   *   Company registrations are decided with the sandbox admin panel on the Approval page (no auto-approval)
    */
   SANDBOX: {
     OTP: "123456",
@@ -40,5 +48,39 @@ window.WHEELTRACK_CONFIG = {
     MAX_OTP_ATTEMPTS: 5,
     LATENCY_MS: 700,
     TRANSPORTER_APPROVAL_SECONDS: 20
-  }
+  },
+
+  /*
+   * Transporter / Shipper registration rules. Client-confirmed items are mandatory.
+   * Entries marked recommended: true are Wheeltrack recommendations awaiting client approval;
+   * switch COMPANY_RECOMMENDATIONS off to hide every one of them.
+   */
+  COMPANY_RECOMMENDATIONS: true,
+  COMPANY_TYPES: ["Private Limited", "Public Limited", "LLP", "Partnership", "Proprietorship", "Other"],
+  // Which Business KYC checks each company type needs: required | optional | na.
+  COMPANY_KYC_RULES: {
+    "Private Limited": { pan: "required", gstin: "required", cin: "required" },
+    "Public Limited": { pan: "required", gstin: "required", cin: "required" },
+    LLP: { pan: "required", gstin: "required", cin: "required" },
+    Partnership: { pan: "required", gstin: "required", cin: "na" },
+    Proprietorship: { pan: "required", gstin: "optional", cin: "na" },
+    Other: { pan: "required", gstin: "optional", cin: "optional" }
+  },
+  /*
+   * Company document checklist. need: "required" for every type, an array of company types that require it,
+   * or "optional". expiry: the document carries a validity date.
+   */
+  COMPANY_DOCUMENTS: [
+    { key: "pan", label: "Company PAN Card", need: "required" },
+    { key: "gst", label: "GST Registration Certificate", need: ["Private Limited", "Public Limited", "LLP", "Partnership"] },
+    { key: "incorporation", label: "Incorporation Certificate", need: ["Private Limited", "Public Limited", "LLP"] },
+    { key: "udyam", label: "Udyam Registration", need: "optional" },
+    { key: "addressProof", label: "Business Address Proof", need: "required", expiry: true },
+    { key: "authorizedProof", label: "Authorized Person Proof", need: "required" },
+    { key: "bankProof", label: "Company Bank Statement / Business Proof", need: ["Partnership", "Proprietorship", "Other"] },
+    { key: "partnershipDeed", label: "Partnership Deed", need: ["Partnership"], recommended: true },
+    { key: "boardResolution", label: "Board Resolution / LLP Authorization", need: "optional", recommended: true }
+  ],
+  // Client-side checks only; the server must enforce its own file type, size and malware rules.
+  UPLOAD: { TYPES: ["application/pdf", "image/jpeg", "image/png"], MAX_MB: 5 }
 };

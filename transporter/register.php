@@ -1,5 +1,5 @@
 <?php
-$pageTitle = 'Wheeltrack | Transporter Register';
-$screen = 'transporter-register';
+$pageTitle = 'Wheeltrack | Transporter Registration';
+$screen = 'company:mobile';
 $assetRoot = '../';
 require __DIR__ . '/../includes/page.php';

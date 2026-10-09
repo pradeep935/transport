@@ -41,7 +41,17 @@
   ];
   const svc = window.WheeltrackServices;
   // Values that must never be persisted (full Aadhaar number, OTPs being typed).
-  const temp = { aadhaarNumber: "", aadhaarOtp: "", loginOtp: "" };
+  const temp = { aadhaarNumber: "", aadhaarOtp: "", loginOtp: "", mobileOtp: "", emailOtp: "", forgotOtp: "", password: "", confirm: "", forgotPassword: "", forgotConfirm: "" };
+  // Earlier prototype builds stored passwords and OTPs; keep only a "password set" flag.
+  if (state.password.value || state.password.confirm) {
+    state.password.set = state.password.set || (String(state.password.value || "").length >= 8 && /\d/.test(state.password.value) && state.password.value === state.password.confirm);
+    delete state.password.value;
+    delete state.password.confirm;
+  }
+  ["mobile", "email"].forEach((key) => delete state[key].otp);
+  ["otp", "password", "confirm"].forEach((key) => delete state.forgot[key]);
+  state.login.password = "";
+  store.save(state);
 
   const icons = {
     back: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/><path d="M21 12H9"/></svg>',
@@ -159,8 +169,12 @@
   // Sidebar navigation: earlier steps are always reachable but only show ✓ when actually complete; a later
   // step is reachable only if it was reached before AND every earlier step's requirement is still complete.
   function passwordValid() {
-    const p = state.password;
-    return p.value.length >= 8 && /\d/.test(p.value) && p.value === p.confirm;
+    return Boolean(state.password.set);
+  }
+  // Password inputs whose value is kept only in memory (temp), never in localStorage.
+  function tempPassword(label, key) {
+    const id = `pw-${key}`;
+    return `<div class="field"><label for="${id}">${label}</label><div class="pw-wrap"><input id="${id}" type="password" autocomplete="new-password" data-temp="${key}" value="${esc(temp[key])}"><button class="pw-eye" type="button" data-toggle-password aria-label="Show password" aria-pressed="false">${icons.eye}</button></div></div>`;
   }
   function stepAccess(key, currentIndex, complete) {
     state.progress = state.progress || {};
@@ -238,7 +252,7 @@
   }
   function siteFooter() {
     const s = page.screen;
-    const onboarding = /^(driver|owner|transporter):/.test(s) || /^business-(oem|insurance|gps|vehicle)$/.test(s) || /-register$/.test(s);
+    const onboarding = /^(driver|owner|transporter|company):/.test(s) || /^business-(oem|insurance|gps|vehicle)$/.test(s) || /-register$/.test(s);
     if (onboarding) return "";
     const partner = page.screen === "business-partner" || page.screen === "register-business";
     const title = partner ? "Not sure which category fits your business?" : "Need help with Wheeltrack?";
@@ -373,7 +387,7 @@
   }
   function renderForgot() {
     return shell(`${pageTitle("Forgot Password", "Enter your account details and reset the password with a demo OTP.")}
-      <div class="card panel">${field("Email or Mobile Number", "forgot.user")}${otp("forgot.otp")}<p class="notice">Demo OTP is <strong>${cfg.DEMO_MOBILE_OTP}</strong>.</p>${field("New Password", "forgot.password", "password")}${field("Confirm Password", "forgot.confirm", "password")}<button class="btn full" type="button" data-action="reset-password">Reset Password</button></div>`, { back: "login.php", narrow: true });
+      <div class="card panel">${field("Email or Mobile Number", "forgot.user")}${otpTemp("forgotOtp")}<p class="notice">Demo OTP is <strong>${cfg.DEMO_MOBILE_OTP}</strong>.</p>${tempPassword("New Password", "forgotPassword")}${tempPassword("Confirm Password", "forgotConfirm")}<button class="btn full" type="button" data-action="reset-password">Reset Password</button></div>`, { back: "login.php", narrow: true });
   }
 
   function renderDriver(step) {
@@ -453,23 +467,43 @@
   function mobileStep() {
     const t = mobileText();
     const number = String(state.mobile.number || "").replace(/\D/g, "").slice(0, 10);
+    return regMobileForm({ form: "mobile", codePath: "mobile.code", numberPath: "mobile.number", code: state.mobile.code, number, text: t });
+  }
+  // ---- Shared registration components: Driver and Transporter / Shipper onboarding use the same markup. ----
+  function regTitle(icon, title, note) {
+    return `<div class="ws-title"><span class="ws-title-icon">${icons[icon] || icons.phoneVerify}</span><div><h1>${title}</h1><p>${note}</p></div></div>`;
+  }
+  // Mobile number + country code + Send OTP. `form` names the submit handler; `extra` adds role-specific lines.
+  function regMobileForm({ form, codePath, numberPath, code, number, text: t, extra = "" }) {
     return `<div class="ws-title">
         <span class="ws-title-icon">${icons.phoneVerify}</span>
         <div><h1>${t.title}</h1><p>${t.note}</p></div>
       </div>
-      <form class="ws-form" data-form="mobile" novalidate>
+      <form class="ws-form" data-form="${form}" novalidate>
         <div class="ws-field">
           <label for="mobile-number">${t.label}</label>
           <div class="ws-phone">
             ${icons.phone}
-            <select class="ws-code" data-field="mobile.code" aria-label="Country code">${["+91"].map((c) => `<option ${c === state.mobile.code ? "selected" : ""}>${c}</option>`).join("")}</select>
-            <input id="mobile-number" type="tel" inputmode="numeric" autocomplete="tel-national" maxlength="10" placeholder="${t.placeholder}" data-field="mobile.number" value="${esc(number)}" aria-describedby="mobile-number-error" aria-invalid="false" required>
+            <select class="ws-code" data-field="${codePath}" aria-label="Country code">${["+91"].map((c) => `<option ${c === code ? "selected" : ""}>${c}</option>`).join("")}</select>
+            <input id="mobile-number" type="tel" inputmode="numeric" autocomplete="tel-national" maxlength="10" placeholder="${t.placeholder}" data-field="${numberPath}" value="${esc(number)}" aria-describedby="mobile-number-error" aria-invalid="false" required>
           </div>
           <p class="field-error" id="mobile-number-error" aria-live="polite"></p>
         </div>
-        <button class="ws-cta" type="submit" ${isValidMobile(number) ? "" : "disabled"}><span class="spinner" aria-hidden="true"></span><span class="ws-cta-label">${t.send}</span>${icons.arrowRight}</button>
-        <p class="ws-secure">${icons.lockSmall}<span>${t.secure}</span></p>
+        <button class="ws-cta" type="submit"><span class="spinner" aria-hidden="true"></span><span class="ws-cta-label">${t.send}</span>${icons.arrowRight}</button>
+        <p class="ws-secure">${icons.lockSmall}<span>${t.secure}</span></p>${extra}
       </form>`;
+  }
+  function regOtpCard({ tempKey, verified, verifiedText, button, extra = "" }) {
+    return `<div class="card panel">${otpTemp(tempKey)}${verified ? `<p class="notice success">${verifiedText}</p>` : ""}${extra}${button}</div>`;
+  }
+  function regEmailCard({ input, button, extra = "" }) {
+    return `<div class="card panel">${input}${extra}${button}</div>`;
+  }
+  function regPasswordCard({ set, keys, button, extra = "" }) {
+    return `<div class="card panel">${set ? '<p class="notice success">Password set. Enter a new one below only if you want to change it.</p>' : ""}${tempPassword("Password", keys[0])}${tempPassword("Confirm Password", keys[1])}${extra}${button}</div>`;
+  }
+  function regConsentCard({ items, errorId, button }) {
+    return `<div class="card panel consent-list">${items.map(([key, label]) => consentItem(key, label)).join("")}<p class="field-error" id="${errorId}" aria-live="polite"></p>${button}</div>`;
   }
   const driverStepIcons = {
     "mobile-otp": "phoneVerify",
@@ -550,7 +584,7 @@
     return `<div class="pd-actions"><a class="pd-back" href="${root(back)}">${icons.back}<span>Back</span></a>${cta}</div>`;
   }
   function wsTitle(step, title, note) {
-    return `<div class="ws-title"><span class="ws-title-icon">${icons[driverStepIcons[step]] || icons.phoneVerify}</span><div><h1>${title}</h1><p>${note}</p></div></div>`;
+    return regTitle(driverStepIcons[step], title, note);
   }
   function langSwitch() {
     const current = state.mobile.language === "Hindi" ? "Hindi" : "English";
@@ -738,23 +772,23 @@
   function driverBody(step) {
     if (step === "mobile-otp") {
       return `${wsTitle(step, "Enter Mobile OTP", `Use demo OTP ${cfg.DEMO_MOBILE_OTP} to verify ${state.mobile.code} ${state.mobile.number || "your mobile number"}.`)}
-        <div class="card panel">${otp("mobile.otp")}${state.mobile.verified ? '<p class="notice success">Mobile OTP verified.</p>' : ""}<button class="btn full" type="button" data-verify="mobile">Verify & Continue</button></div>`;
+        ${regOtpCard({ tempKey: "mobileOtp", verified: state.mobile.verified, verifiedText: "Mobile OTP verified.", button: '<button class="btn full" type="button" data-verify="mobile">Verify & Continue</button>' })}`;
     }
     if (step === "email") {
       return `${wsTitle(step, "Verify Email Address", "We will send an OTP to verify your email address.")}
-        <div class="card panel">${field("Email Address", "email.address", "email")}<button class="btn full" type="button" data-next="driver/email-otp.php">Send OTP</button></div>`;
+        ${regEmailCard({ input: field("Email Address", "email.address", "email"), button: '<button class="btn full" type="button" data-next="driver/email-otp.php">Send OTP</button>' })}`;
     }
     if (step === "email-otp") {
       return `${wsTitle(step, "Enter Email OTP", `Use demo OTP ${cfg.DEMO_EMAIL_OTP} to verify ${state.email.address || "your email"}.`)}
-        <div class="card panel">${otp("email.otp")}${state.email.verified ? '<p class="notice success">Email OTP verified.</p>' : ""}<button class="btn full" type="button" data-verify="email">Verify & Continue</button></div>`;
+        ${regOtpCard({ tempKey: "emailOtp", verified: state.email.verified, verifiedText: "Email OTP verified.", button: '<button class="btn full" type="button" data-verify="email">Verify & Continue</button>' })}`;
     }
     if (step === "password") {
       return `${wsTitle(step, "Set Your Password", "Use at least 8 characters with a number.")}
-        <div class="card panel">${field("Password", "password.value", "password")}${field("Confirm Password", "password.confirm", "password")}<button class="btn full" type="button" data-action="password-next">Continue</button></div>`;
+        ${regPasswordCard({ set: state.password.set, keys: ["password", "confirm"], button: '<button class="btn full" type="button" data-action="password-next">Continue</button>' })}`;
     }
     if (step === "consent") {
       return `${wsTitle(step, "Terms & Consent", "Review the required terms before moving ahead.")}
-        <div class="card panel consent-list">${consentItem("terms", "I agree to Terms & Conditions")}${consentItem("privacy", "I agree to Privacy Policy")}${consentItem("communication", "I agree to receive relevant communication via SMS, Email or WhatsApp.")}<p class="field-error" id="consent-error" aria-live="polite"></p><button class="btn full" type="button" data-action="consent-next">Continue</button></div>`;
+        ${regConsentCard({ items: [["terms", "I agree to Terms & Conditions"], ["privacy", "I agree to Privacy Policy"], ["communication", "I agree to receive relevant communication via SMS, Email or WhatsApp."]], errorId: "consent-error", button: '<button class="btn full" type="button" data-action="consent-next">Continue</button>' })}`;
     }
     if (step === "personal-details") {
       const p = state.personal;
@@ -958,6 +992,27 @@
     aadhaar: {
       title: "Aadhaar Authentication Consent", link: "Read Aadhaar consent", path: "aadhaar.consent", required: true,
       sections: ["Purpose of Authentication", "Information Received from UIDAI", "Storage & Masking of Aadhaar Number", "Voluntary Consent & Alternatives"]
+    },
+    // Transporter / Shipper company registration.
+    coTerms: {
+      title: "Terms & Conditions", link: "Read Terms & Conditions", path: "company.consent.terms", required: true,
+      sections: ["Introduction", "Eligibility & Company Registration", "Company & Representative Responsibilities", "Driver Association & Vehicle Assignment", "Use of the Platform", "Fees & Payments", "Suspension & Termination", "Limitation of Liability", "Governing Law & Disputes", "Contact Us"]
+    },
+    coPrivacy: {
+      title: "Privacy Policy", link: "Read Privacy Policy", path: "company.consent.privacy", required: true,
+      sections: ["Information We Collect", "How We Use Your Information", "Business KYC & Document Verification", "Representative Identity Data", "Sharing with Drivers & Partners", "Data Retention", "Your Rights", "Security", "Grievance Officer & Contact"]
+    },
+    coDeclaration: {
+      title: "Business Information Declaration", link: "Read declaration", path: "company.consent.declaration", required: true,
+      sections: ["Accuracy of Company Information", "Authority to Register the Company", "Validity of Uploaded Documents", "Obligation to Update Changes"]
+    },
+    coIdentity: {
+      title: "Identity Verification Consent", link: "Read identity consent", path: "company.consent.identity", required: true,
+      sections: ["Purpose of Identity Verification", "Information Received from the Verification Provider", "Storage & Masking of Identity Numbers", "Voluntary Consent & Alternatives"]
+    },
+    coCommunication: {
+      title: "Communication Consent", link: "Read communication details", path: "company.consent.communication", required: false,
+      sections: ["Channels (SMS, Email, WhatsApp)", "Types of Messages", "How to Opt Out"]
     }
   };
   function consentItem(key, label) {
@@ -1033,6 +1088,14 @@
   function ownerTitle(step, title, note) {
     return `<div class="ws-title"><span class="ws-title-icon">${icons[ownerTitleIcons[step]] || icons.truck}</span><div><h1>${title}</h1><p>${note}</p></div></div>`;
   }
+  // GPS status is saved per vehicle. Any answer (or none) is accepted; it never blocks vehicle registration.
+  const GPS_OPTIONS = [["yes", "Yes"], ["no", "No"], ["unknown", "Don't Know"]];
+  function gpsQuestion(v) {
+    return `<fieldset class="ws-field">
+            <legend class="ws-label">Does this vehicle have GPS installed?</legend>
+            <div class="lang-switch gps-switch" role="radiogroup" aria-label="Does this vehicle have GPS installed?">${GPS_OPTIONS.map(([value, label]) => `<label class="${v.gps === value ? "selected" : ""}"><input type="radio" name="vehicleGps" value="${value}" ${v.gps === value ? "checked" : ""}><span>${label}</span></label>`).join("")}</div>
+          </fieldset>`;
+  }
   function verifiedBadge(ok, okText = "Verified", waitText = "Pending verification") {
     return badge(ok ? okText : waitText, ok ? "green" : "yellow");
   }
@@ -1047,6 +1110,7 @@
             <div class="ws-phone reg-input">${icons.truck}<input id="vehicle-reg" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="13" placeholder="e.g. MH12AB1234" data-field="vehicle.registration" value="${esc(v.registration)}" aria-describedby="vehicle-reg-error"></div>
             <p class="field-error" id="vehicle-reg-error" aria-live="polite"></p>
           </div>
+          ${gpsQuestion(v)}
           ${rcOk ? `<p class="notice success">RC verified for <strong>${esc(v.registration)}</strong>. Vehicle details have been fetched.</p>` : ""}
           <button class="ws-cta" type="submit"><span class="spinner" aria-hidden="true"></span><span class="ws-cta-label">${rcOk ? "Re-verify RC" : "Verify RC"}</span>${icons.arrowRight}</button>
           ${rcOk ? `<a class="pd-back center-link" href="${root("driver/owner/rc.php")}">View RC details${icons.arrowRight}</a>` : ""}
@@ -1223,7 +1287,7 @@
     </div>`;
   }
   function associationLabel(t) {
-    return { none: "Not submitted", pending: "Pending Transporter Approval", approved: "Transporter Approved", rejected: "Declined by Transporter" }[t.association] || "Not submitted";
+    return { none: "Not submitted", pending: "Pending Transporter Approval", approved: "Transporter Approved", rejected: "Declined by Transporter", removed: "Removed by Transporter" }[t.association] || "Not submitted";
   }
   function transporterBody(step) {
     const t = state.transporter;
@@ -1296,7 +1360,7 @@
     if (t.submission !== "submitted") return needsFirst(step, "Approval Status", "Submit your association request first.", "driver/transporter/review.php");
     if (step === "request-status") {
       const approved = t.association === "approved";
-      const rejected = t.association === "rejected";
+      const rejected = ["rejected", "removed"].includes(t.association);
       const stages = [
         ["Registration submitted", true],
         ["Transporter validated", true],
@@ -1322,6 +1386,7 @@
               <div><dt>Submitted On</dt><dd>${esc(formatDate(t.submittedAt))}</dd></div>
               <div><dt>Status</dt><dd>${badge(associationLabel(t), approved ? "green" : rejected ? "red" : "yellow")}</dd></div>
               <div><dt>Last Checked</dt><dd data-last-checked>${t.lastCheckedAt ? esc(new Date(t.lastCheckedAt).toLocaleTimeString("en-GB")) : "—"}</dd></div>
+              ${t.reason && ["rejected", "removed"].includes(t.association) ? `<div class="wide"><dt>Reason from Transporter</dt><dd data-no-translate>${esc(t.reason)}</dd></div>` : ""}
             </dl>
             ${sourceTag(t.source)}
           </section>
@@ -1450,7 +1515,7 @@
     if (!owner) return transporterDashboard();
     const name = `${state.personal.first || "Rajesh"} ${state.personal.last || "Kumar"}`;
     const initials = name.split(" ").map((part) => part[0] || "").join("").slice(0, 2).toUpperCase();
-    const nav = [["Dashboard", "grid", true], ["My Profile", "driver"], ["My Vehicle", "truck"], ["Documents", "idCard"], ["Status", "shield"]];
+    const nav = [["Dashboard", "grid", "#overview", true], ["My Profile", "driver", root("driver/personal-details.php")], ["My Vehicle", "truck", "#vehicle"], ["Documents", "idCard", "#documents"], ["Status", "shield", root("driver/owner/status.php")]];
     const kpis = [
       ["Vehicle Status", owner ? "Active" : "Read-only", "truck", "green"],
       ["Documents", "Valid", "idCard", "green"],
@@ -1460,7 +1525,7 @@
     return `<main class="dashboard db">
       <aside class="dash-nav db-nav">
         ${brand("sm")}
-        <nav class="db-menu">${nav.map(([label, icon, active]) => `<a class="${active ? "active" : ""}" href="#" ${active ? 'aria-current="page"' : ""}>${icons[icon]}<span>${label}</span></a>`).join("")}</nav>
+        <nav class="db-menu">${nav.map(([label, icon, href, active]) => `<a class="${active ? "active" : ""}" href="${href}" ${active ? 'aria-current="page"' : ""}>${icons[icon]}<span>${label}</span></a>`).join("")}</nav>
         <div class="db-user"><span class="db-avatar" data-no-translate>${esc(initials)}</span><span><strong data-no-translate>${esc(name)}</strong><small>${owner ? "Owner Driver" : "Transporter Driver"}</small></span></div>
       </aside>
       <section class="dash-main db-main">
@@ -1468,14 +1533,14 @@
           <div><p class="db-kicker">${owner ? "Owner driver dashboard" : "Transporter driver dashboard"}</p><h1>Welcome, ${esc(name)}</h1></div>
           <div class="db-actions">${langSwitch()}${callLink()}</div>
         </header>
-        <div class="db-body">
+        <div class="db-body" id="overview">
           <div class="db-kpis">${kpis.map(([label, value, icon, tone]) => `<div class="db-kpi"><span class="db-kpi-icon ${tone}">${icons[icon]}</span><span><small>${label}</small><strong>${value}</strong></span></div>`).join("")}</div>
           <div class="db-grid">
-            <section class="db-card">
+            <section class="db-card" id="vehicle">
               <header class="db-card-head"><h2>${owner ? "Owner Driver Vehicle" : "Transporter Assigned Vehicle"}</h2>${badge("Verified", "green")}</header>
               ${ownerVehicleSummary(owner)}
             </section>
-            <section class="db-card">
+            <section class="db-card" id="documents">
               <header class="db-card-head"><h2>Document Status</h2>${badge("Valid", "green")}</header>
               ${documentTable(owner)}
             </section>
@@ -1512,7 +1577,7 @@
 
   const i18n = window.WheeltrackI18n;
   function hindiActive() {
-    return Boolean(i18n) && state.mobile.language === "Hindi" && (/^(driver|owner|transporter):/.test(page.screen) || page.screen === "login");
+    return Boolean(i18n) && state.mobile.language === "Hindi" && (/^(driver|owner|transporter|company):/.test(page.screen) || page.screen === "login");
   }
   // Dialogs (policy text, camera) live outside #app so a re-render never closes them.
   const layer = document.createElement("div");
@@ -1563,7 +1628,7 @@
   }
   function render() {
     const screen = page.screen;
-    const redirect = flowRedirect(screen);
+    const redirect = screen.startsWith("company:") ? (company ? company.redirect(screen.split(":")[1]) : "register/index.php") : flowRedirect(screen);
     if (redirect) {
       window.location.replace(root(redirect));
       return;
@@ -1587,7 +1652,7 @@
     else if (screen === "business-insurance") app.innerHTML = renderPlaceholder("Insurance", "assets/images/driver-truck.png");
     else if (screen === "business-gps") app.innerHTML = renderPlaceholder("GPS Companies", "assets/images/driver-truck.png");
     else if (screen === "business-vehicle") app.innerHTML = renderPlaceholder("Vehicle Manufacturer", "assets/images/login-truck.png");
-    else if (screen === "transporter-register") app.innerHTML = renderPlaceholder("Transporter / Shipper Registration", "assets/images/driver-truck.png");
+    else if (screen.startsWith("company:")) app.innerHTML = company.render(screen.split(":")[1]);
     else if (screen === "manufacturer-register") app.innerHTML = renderPlaceholder("Manufacturer Registration", "assets/images/login-truck.png");
     app.insertAdjacentHTML("beforeend", siteFooter());
     applyLanguage();
@@ -1766,7 +1831,7 @@
       return;
     }
     const changed = res.status !== t.association;
-    Object.assign(t, { association: res.status, decidedAt: res.decidedAt || t.decidedAt, vehicle: res.vehicle || t.vehicle, lastCheckedAt: new Date().toISOString(), source: res.source });
+    Object.assign(t, { association: res.status, decidedAt: res.decidedAt || t.decidedAt, reason: res.reason || "", vehicle: res.vehicle !== undefined ? res.vehicle : t.vehicle, lastCheckedAt: new Date().toISOString(), source: res.source });
     store.save(state);
     if (changed || !silent) render();
     else {
@@ -1989,10 +2054,11 @@
     if (event.target.id === "mobile-number") {
       const input = event.target;
       input.value = input.value.replace(/\D/g, "").slice(0, 10);
+      // Send OTP stays enabled (solid red); an empty or invalid number is rejected on submit with an inline error.
       const valid = isValidMobile(input.value);
-      input.closest("form").querySelector(".ws-cta").disabled = !valid;
       if (valid || input.closest(".ws-phone").classList.contains("invalid")) showMobileError(input, input.value, input.value.length === 10);
     }
+    if (event.target.dataset.temp) temp[event.target.dataset.temp] = event.target.value;
     if (event.target.id === "login-mobile") {
       event.target.value = event.target.value.replace(/\D/g, "").slice(0, 10);
       state.login.mobile = event.target.value;
@@ -2052,6 +2118,12 @@
       render();
       const selected = document.querySelector('input[name="mobileLanguage"]:checked');
       if (selected) selected.focus();
+      return;
+    }
+    if (event.target.name === "vehicleGps") {
+      state.vehicle.gps = event.target.value;
+      store.save(state);
+      event.target.closest(".gps-switch").querySelectorAll("label").forEach((label) => label.classList.toggle("selected", label.contains(event.target)));
       return;
     }
     if (event.target.name === "operatingModel") {
@@ -2155,12 +2227,14 @@
     const verify = event.target.closest("[data-verify]");
     if (verify) {
       if (verify.dataset.verify === "mobile") {
-        if (state.mobile.otp !== cfg.DEMO_MOBILE_OTP) return alert(`Use demo OTP ${cfg.DEMO_MOBILE_OTP}.`);
+        if (temp.mobileOtp !== cfg.DEMO_MOBILE_OTP) return alert(`Use demo OTP ${cfg.DEMO_MOBILE_OTP}.`);
+        temp.mobileOtp = "";
         state.mobile.verified = true;
         store.save(state);
         go("driver/email.php");
       } else {
-        if (state.email.otp !== cfg.DEMO_EMAIL_OTP) return alert(`Use demo OTP ${cfg.DEMO_EMAIL_OTP}.`);
+        if (temp.emailOtp !== cfg.DEMO_EMAIL_OTP) return alert(`Use demo OTP ${cfg.DEMO_EMAIL_OTP}.`);
+        temp.emailOtp = "";
         state.email.verified = true;
         store.save(state);
         go("driver/password.php");
@@ -2252,7 +2326,13 @@
       return;
     }
     if (name === "password-next") {
-      if (state.password.value.length < 8 || !/\d/.test(state.password.value) || state.password.value !== state.password.confirm) return alert("Password must be 8+ characters, include a number, and match confirmation.");
+      // Leaving the fields empty keeps a password that was already set.
+      if (state.password.set && !temp.password && !temp.confirm) return go("driver/consent.php");
+      if (temp.password.length < 8 || !/\d/.test(temp.password) || temp.password !== temp.confirm) return alert("Password must be 8+ characters, include a number, and match confirmation.");
+      state.password.set = true;
+      temp.password = "";
+      temp.confirm = "";
+      store.save(state);
       go("driver/consent.php");
     }
     if (name === "consent-next") {
@@ -2272,7 +2352,16 @@
     if (name === "submit-association") {
       const t = state.transporter;
       setLoading(action, true, "Submitting…");
-      svc.TransporterService.requestAssociation({ driverId: ensureDriverId(), transporterId: t.id }).then((res) => {
+      // Read-only summary for the transporter's review. Only masked identifiers are shared.
+      const driver = {
+        name: [state.personal.first, state.personal.middle, state.personal.last].filter(Boolean).join(" "),
+        mobile: state.mobile.number ? maskMobile(state.mobile.number) : "",
+        city: [state.personal.city, state.personal.state].filter(Boolean).join(", "),
+        kyc: state.kyc.status === "verified" ? "verified" : identitySource() === "manual" ? "manual_review" : "pending",
+        licence: dlSource(),
+        licenceClasses: state.dl.manual.classes || ""
+      };
+      svc.TransporterService.requestAssociation({ driverId: ensureDriverId(), transporterId: t.id, driver }).then((res) => {
         if (!res.ok) {
           setLoading(action, false, "Submit Association Request");
           return setMessage("association-error", serviceError(res.code));
@@ -2310,7 +2399,7 @@
     if (value !== store.getByPath(state, path)) {
       store.setByPath(state, path, value);
       // A new state invalidates the district chosen under the old one.
-      const dependent = { "personal.currentState": "personal.currentCity", "personal.state": "personal.city" }[path];
+      const dependent = { "personal.currentState": "personal.currentCity", "personal.state": "personal.city", "company.details.state": "company.details.city", "company.details.opState": "company.details.opCity" }[path];
       if (dependent) store.setByPath(state, dependent, "");
     }
     comboClose(combo);
@@ -2386,8 +2475,8 @@
   function runDemo(kind) {
     if (kind === "reset") state = store.clone(store.defaults);
     if (kind === "otp") {
-      state.mobile.otp = cfg.DEMO_MOBILE_OTP;
-      state.email.otp = cfg.DEMO_EMAIL_OTP;
+      temp.mobileOtp = cfg.DEMO_MOBILE_OTP;
+      temp.emailOtp = cfg.DEMO_EMAIL_OTP;
       state.mobile.verified = true;
       state.email.verified = true;
     }
@@ -2399,6 +2488,16 @@
     store.save(state);
     render();
   }
+
+  // Transporter / Shipper company module (assets/js/company.js) renders with the shared UI helpers.
+  const company = window.WheeltrackCompany && window.WheeltrackCompany({
+    page, cfg, svc, store, icons, temp, POLICIES,
+    getState: () => state,
+    render, root, go, esc, badge, shell, onboardWorkspace, pdHead, pdField, pdSelect, pdCombo, sourceTag, otpTemp, resendRow,
+    setMessage, setLoading, serviceError, formatDate, maskMobile, isValidMobile, langSwitch, brand, callLink, devbar, consentItem,
+    field, regTitle, regMobileForm, regOtpCard, regEmailCard, regPasswordCard, regConsentCard,
+    openModal, closeModal, hindiActive
+  });
 
   render();
   if (page.screen === "transporter:request-status" && state.transporter.association === "pending") checkAssociation(null, true);
